@@ -88,9 +88,9 @@ class SoftImpute(Solver):
             shrinkage_value=0,
             convergence_threshold=1e-05,
             max_iters=100,
-            max_rank=2, # TODO: add logic so this cant be > m
+            max_rank=2, 
             n_power_iterations=8,
-            init_fill_method="zero",
+            fill_method="zero",
             min_value=None,
             max_value=None,
             normalizer=None,
@@ -118,7 +118,7 @@ class SoftImpute(Solver):
         n_power_iterations : int
             Number of power iterations to perform with randomized SVD
 
-        init_fill_method : str
+        fill_method : str
             How to initialize missing values of data matrix, default is
             to fill them with zeros.
 
@@ -136,7 +136,7 @@ class SoftImpute(Solver):
         """
         Solver.__init__(
             self,
-            fill_method=init_fill_method,
+            fill_method=fill_method,
             min_value=min_value,
             max_value=max_value,
             max_rank=max_rank,
@@ -149,6 +149,8 @@ class SoftImpute(Solver):
         self.verbose = verbose
         self.m = None
         self.n = None
+        self.X = None
+        self.svd = None
 
 #    def _converged(self, X_old, X_new, missing_mask):
 #        # check for convergence
@@ -161,8 +163,6 @@ class SoftImpute(Solver):
 
     def _fnorm(self, SVD_old, SVD_new):
         # U, S, V is the order of SVD matrices. This function takes the Frobenius Norm of an SVD decomposed matrix.
-        # TODO - make sure this equation is correct. It is borrowed from travisbrady's py-soft-impute package
-        #import ipdb; ipdb.set_trace()
         U_old, D_sq_old, V_old = SVD_old
         U_new, D_sq_new, V_new = SVD_new
         utu = D_sq_new.dot(U_new.T.dot(U_old))
@@ -182,13 +182,21 @@ class SoftImpute(Solver):
         ones = np.ones(n)
         return U * np.outer(ones, D)
 
-    def _svd(self, X, max_rank=None):
-        if issparse(X): # this will raise an error if integers are sent, rather than floats. np.array([float(i) for i in X.data]) is one solution, if we need it
-            if max_rank is None:
-                max_rank = min(X.shape)
-            return linalg.svds(X, k=max_rank, maxiter=self.n_power_iterations) 
+    def _xhat_pred(self, x_svd, x):
+        """predicts x values for X original indices/columns"""
+        #TODO - get rid of the inputs here, use the self.x and self.svd
+        row_ids, col_ids, _ = self.missing_mask
+        targets = zip(row_ids, col_ids)
+        n_preds = len(targets)
+        res = np.empty(n_preds)
 
-        elif max_rank:
+        for idx, (r, c) in enumerate(targets):
+            res[idx] = self._pred_sparse(r, c, x_svd)
+
+        return res
+
+    def _svd(self, X, max_rank=None):
+        if max_rank:
             # if we have a max rank then perform the faster randomized SVD
             return randomized_svd(
                 X,
@@ -201,22 +209,11 @@ class SoftImpute(Solver):
                 full_matrices=False,
                 compute_uv=True)
 
-    def _x_real_pred(self, U, s, V, X_sparse, missing_mask):
-        """predicts X values only for specified indices/columns"""
-        nnz = X_sparse.nnz
-        res = np.zeros(nnz)
-        row_id, col_id, _ = missing_mask # row and column indices are drawn from missing_mask to avoid unnecessary conversion to COO format
-        targets = zip(row_id, col_id)
-        for idx, (r, c) in enumerate(targets):
-            #import ipdb; ipdb.set_trace()
-            res[idx] = np.sum(U[r]*s*V[:,c])
-            #print(res[idx])
-        return res
 
     def _svd_step(self, X, shrinkage_value):
         """
         Returns reconstructed X from low-rank thresholded SVD and
-        the rank achieved.
+        the rank achieved. Only for dense matrices
         """
         U, s, V = self._svd(X, self.max_rank)
         s_thresh = np.maximum(s - shrinkage_value, 0)
@@ -228,10 +225,11 @@ class SoftImpute(Solver):
         X_reconstruction = np.dot(U_thresh, np.dot(S_thresh, V_thresh))
         return X_reconstruction, rank
 
-    def _max_singular_value(self, X_filled):
+    def _max_singular_value(self):
         # quick decomposition of X_filled into rank-1 SVD
+        X_filled = self.X_fill
         if self.fill_method == 'sparse':
-            return X_filled[1][0]
+            return X_filled[1][0] #TODO - Replace with self.svd, or rename if we want it to apply for else cond.
         else:
             _, s, _ = randomized_svd(
                 X_filled,
@@ -239,87 +237,98 @@ class SoftImpute(Solver):
                 n_iter=5)
             return s[0]
 
-    def _als_step(self, X_fill_svd, X_prev):
+    def _als_u_step(self, X_fill_svd, X_prev):
         U, D_sq, V = X_fill_svd
-        U_old, D_sq_old, V_old = U.copy(), D_sq.copy(), V.copy()
 
-        # U Step
-       # import ipdb; ipdb.set_trace()
         B = (X_prev.l_mult(U.T)).T
+
         if self.shrinkage_value > 0:
             B = self._UD(B, D_sq / (D_sq + self.shrinkage_value), self.m)
         V, D_sq, _ = self._svd(B) # V is set to the U slot from V's SVD on purpose
 
-        # V Step
-        #obj=(.5*Frobsmlr(x,U,B,nx=normx)^2+lambda*sum(Dsq))/nz
+        return V, D_sq
+
+    def _als_v_step(self, X_fill_svd, X_prev):
+        U, D_sq, V = X_fill_svd
+
         A = X_prev.r_mult(V)
+
         if self.shrinkage_value > 0:
             A = self._UD(A, D_sq / (D_sq + self.shrinkage_value), self.n)
+
         U, D_sq, V_part = self._svd(A)
         V = V.dot(V_part.T) # just for computing the convergence criterion
+        return U, D_sq, V
 
-        ratio = self._fnorm((U_old,D_sq_old,V_old),(U,D_sq,V))
-        converged = (ratio < self.convergence_threshold)
-        X_fill_svd = (U, D_sq, V)
-        return X_fill_svd, converged
-    
+    def _als_cleanup_step(self, X_fill_svd, X_prev):
+        U, D_sq, V = X_fill_svd
+        A = X_prev.r_mult(V)
+        U, D_sq, V_part = self._svd(A) 
+        V = V.dot(V_part.T)
+        D_sq = np.clip(D_sq - self.shrinkage_value, a_min=0, a_max=None) # this shrinks the singular values by lambda and clips them at zero
+        return U, D_sq, V
+
     def _als(self, X_fill_svd, X_prev):
         for i in range(self.max_iters):
-            X_fill_svd, converged = self._als_step(X_fill_svd, X_prev) 
+            U, D_sq, V = X_fill_svd
+            U_old, D_sq_old, V_old = U.copy(), D_sq.copy(), V.copy()
+            V, D_sq = self._als_u_step(X_fill_svd, X_prev)
+            X_fill_svd = U, D_sq, V
+            U, D_sq, V = self._als_v_step(X_fill_svd, X_prev)
+            converged = self._converged((U_old, D_sq_old, V_old), (U, D_sq, V))
+            X_fill_svd = (U, D_sq, V)
+
             if converged:
                 break
+
         if self.shrinkage_value > 0:
-            U, D_sq, V = X_fill_svd
-            A = X_prev.r_mult(V)
-            U, D_sq, V_part = self._svd(A) 
-            V = V.dot(V_part.T)
-            D_sq = np.clip(D_sq - self.shrinkage_value, a_min=0, a_max=None) # this shrinks the singular values by lambda and clips them at zero
-            X_fill_svd = (U, D_sq, V) #TODO - make this a single V_step function, since its used in _als_step as well
+            X_fill_svd = self._als_cleanup_step(X_fill_svd, X_prev) 
+
         return X_fill_svd
 
-    def solve(self, X, missing_mask, X_original=None, max_rank=None):
+    def solve(self, X, X_original=None):
         """
         X : 3-d or 2-d array
             X is a simple 2-d array if the input is dense. 
             X is a 3-d array composed of a U matrix, a D singular values array, and a V matrix if the input is sparse.
 
-        missing_mask : array or list of matrices
-            missing_mask is [x_true_rows, x_true cols, x_dense_shape] if the matrix is sparse. Otherwise, missing_mask is a boolean array indicating if value is nan at any given index of the original X matrix. 
         """
+        self.X_fill = X
+        self.X = X_original
         X_filled = X
+        missing_mask = self.missing_mask
         if self.fill_method != 'sparse':
             observed_mask = ~missing_mask
 
-        max_singular_value = self._max_singular_value(X_filled)
-        J = max_rank
+        max_singular_value = self._max_singular_value()
+        J = self.max_rank
 
         if X_original is not None:
-            self.n, self.m = X_original.shape
-            x_res = X_original.copy()
-            X_fill_svd = X_filled # renaming because X_filled is an SVD, if the original matrix was sparse. Its clunky do do it this way, but if X_original was passed it is safe to say we had a sparse matrix to start.
+            self.n, self.m = self.X.shape
+            x_res = self.X.copy()
+            X_fill_svd = self.X_fill # renaming because X_filled is an SVD, if the original matrix was sparse. Its clunky do do it this way, but if X_original was passed it is safe to say we had a sparse matrix to start.
 
         if self.verbose:
             print("[SoftImpute] Max Singular Value of X_init = %f" % (
                 max_singular_value))
 
-        if self.shrinkage_value:
-            shrinkage_value = self.shrinkage_value
-        else:
+        if not self.shrinkage_value:
             # totally hackish heuristic: keep only components
             # with at least 1/50th the max singular value
-            shrinkage_value = max_singular_value / 50.0
+            self.shrinkage_value = max_singular_value / 50.0
 
+        shrinkage_value = self.shrinkage_value
+        
         for i in range(self.max_iters):
             if self.fill_method != 'sparse':
+                
                 X_reconstruction, rank = self._svd_step(X_filled, shrinkage_value)
                 converged = self._converged(self._svd(X_filled), self._svd(X_reconstruction))
                 X_filled[missing_mask] = X_reconstruction[missing_mask]
-#                max_rank=self.max_rank)
-#            X_reconstruction = self.clip(X_reconstruction)
+                X_reconstruction = self.clip(X_reconstruction)
 
             else:
                 X_fill_svd_old = X_fill_svd
-                #import ipdb; ipdb.set_trace()
                 U, Dsq, V = X_fill_svd
 
                 if i == 0:
@@ -327,7 +336,7 @@ class SoftImpute(Solver):
 
                 else:
                     BD = self._UD(V, Dsq, self.m)
-                    x_hat = self._x_real_pred(U, Dsq, V.T, X_original, missing_mask)
+                    x_hat = self._xhat_pred(X_fill_svd, X_original)
                     x_res.data = X_original.data - x_hat # TODO - this may not work if .data isn't a type for the input data source. Also, can the input source data be overwritten like this?
                     X_filled = SPLR(x_res, U, BD)
 
@@ -372,6 +381,10 @@ class SoftImpute(Solver):
             x_fill_svd = U[:,:J], D_sq[:J], V[:, :J]
             return X_fill_svd
 
+    def predict(self, row_ids, col_ids):
+        if self.fill_method == "sparse":
+            targets = zip(row_ids, col_ids)
+
 
 if __name__ == '__main__':
     # original version - mat = np.array([[0.8654889, 0.01565179, 0.1747903, 0, 0],[-0.6004172, 0, -0.2119090, 0, 0],[-0.7169292, 0, 0, 0.06437356, -0.09754133],[0.6965558, -0.50331812, 0.5584839, 1.54375663, 0],[1.2311610, -0.34232368, -0.8102688, -0.82006429, -0.13256942],[0.2664415, 0.14486388, 0, 0, -2.24087863]])
@@ -379,7 +392,7 @@ if __name__ == '__main__':
     # xsc = bscale.fit_transform(mat)
     xsc = np.array([[ 0.1390011, -0.09270246, -0.04629866, 0, 0], [-0.4469535, 0,  0.44695354, 0, 0], [-0.8252855, 0, 0,  0.1160078,  0.7092777], [-0.1981945, -0.7993484,  0.16913247,  0.8089969, 0], [ 0.9662344,  0.01088327, -0.56979652, -0.9250004,  0.5176792], [ 0.3651963,  0.86175224, 0, 0, -1.2269486]])
     x_orig = csc_matrix(xsc)
-    sf = SoftImpute(max_rank=3, shrinkage_value=1, init_fill_method='sparse')
+    sf = SoftImpute(max_rank=3, shrinkage_value=1, fill_method='sparse')
    # X_original, missing_mask = sf.prepare_input_data(x_orig)
    # X_svd = sf.fill(X_original, missing_mask, inplace=True)
    # U, Dsq, V = X_svd
