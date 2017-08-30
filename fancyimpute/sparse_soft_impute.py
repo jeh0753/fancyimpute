@@ -297,8 +297,6 @@ class SoftImpute(Solver):
         self.X = X_original
         X_filled = X
         missing_mask = self.missing_mask
-        if self.fill_method != 'sparse':
-            observed_mask = ~missing_mask
 
         max_singular_value = self._max_singular_value()
         J = self.max_rank
@@ -319,15 +317,19 @@ class SoftImpute(Solver):
 
         shrinkage_value = self.shrinkage_value
         
-        for i in range(self.max_iters):
-            if self.fill_method != 'sparse':
-                
-                X_reconstruction, rank = self._svd_step(X_filled, shrinkage_value)
-                converged = self._converged(self._svd(X_filled), self._svd(X_reconstruction))
-                X_filled[missing_mask] = X_reconstruction[missing_mask]
-                X_reconstruction = self.clip(X_reconstruction)
+        if self.fill_method != 'sparse':
+            observed_mask = ~missing_mask
 
-            else:
+            for i in range(self.max_iters):
+                x_reconstruction, rank = self._svd_step(x_filled, shrinkage_value)
+                converged = self._converged(self._svd(x_filled), self._svd(x_reconstruction))
+                x_filled[missing_mask] = x_reconstruction[missing_mask]
+                x_reconstruction = self.clip(x_reconstruction)
+
+            return X_filled
+
+        else:
+            for i in range(self.max_iters):
                 X_fill_svd_old = X_fill_svd
                 U, Dsq, V = X_fill_svd
 
@@ -342,6 +344,23 @@ class SoftImpute(Solver):
 
                 X_fill_svd = self._als(X_fill_svd, X_filled)
                 converged = self._converged(X_fill_svd_old, X_fill_svd)
+
+                if converged:
+                    break
+            
+            if self.verbose:
+                print("[SoftImpute] Stopped after iteration %d for lambda=%f" % (
+                    i + 1,
+                    shrinkage_value))
+            U, D_sq, V = X_fill_svd
+            A = X_filled.r_mult(V)
+            U, D_sq, V_part = self._svd(A)
+            V = X_filled.a.dot(V_part.T)
+            D_sq = np.clip(D_sq - self.shrinkage_value, a_min=0, a_max=None)
+            J = min((D_sq>0).sum(), J)
+            x_fill_svd = U[:,:J], D_sq[:J], V[:, :J]
+            self.X_fill = X_fill_svd
+            return X_fill_svd
 
             # print error on observed data
 #            if self.verbose:
@@ -360,32 +379,38 @@ class SoftImpute(Solver):
 #                X_new=X_reconstruction,
 #                missing_mask=missing_mask)
 #            X_filled[missing_mask] = X_reconstruction[missing_mask]
-            if converged:
-                break
 
-        if self.verbose:
-            print("[SoftImpute] Stopped after iteration %d for lambda=%f" % (
-                i + 1,
-                shrinkage_value))
-
-        if self.fill_method != 'sparse':
-            return X_filled
-
+    def predict(self, row_id, col_id):
+        irows, icols, _ = self.missing_mask
+        existing = zip(irows, icols)
+        if isinstance(row_id, (int, long)) and isinstance(col_id, (int, long)):
+            if (row_id, col_id) in existing:
+                return self.X[row_id, col_id]
+            elif col_id < self.m and row_id < self.n:
+                return self._pred_sparse(row_id, col_id, self.X_fill)
+            else:
+                    if col_id >= self.m:
+                        raise ValueError("Column index %s is out of range" % (col_id))
+                    if row_id >= self.n:
+                        raise ValueError("Row index %s is out of range" % (row_id))
         else:
-            U, D_sq, V = X_fill_svd
-            A = X_filled.r_mult(V)
-            U, D_sq, V_part = self._svd(A)
-            V = X_filled.a.dot(V_part.T)
-            D_sq = np.clip(D_sq - self.shrinkage_value, a_min=0, a_max=None)
-            J = min((D_sq>0).sum(), J)
-            x_fill_svd = U[:,:J], D_sq[:J], V[:, :J]
-            return X_fill_svd
+            raise ValueError("Input to predict must be two integers. Use predict_many to predict for multiple index pairs at once")
 
-    def predict(self, row_ids, col_ids):
-        if self.fill_method == "sparse":
+    def predict_many(self, row_ids, col_ids):
+        if isinstance(row_ids, (int, long)) and isinstance(col_ids, (int, long)):
+            return self.predict(row_ids, col_ids)
+
+        elif len(row_ids) != len(col_ids):
+            raise ValueError("Length of row list and column list must match")
+
+        elif self.fill_method == "sparse":
             targets = zip(row_ids, col_ids)
+            res = np.empty(len(targets))
+            for idx, (r, c) in enumerate(targets):
+                res[idx] = self.predict(r, c)
+            return res
 
-
+                
 if __name__ == '__main__':
     # original version - mat = np.array([[0.8654889, 0.01565179, 0.1747903, 0, 0],[-0.6004172, 0, -0.2119090, 0, 0],[-0.7169292, 0, 0, 0.06437356, -0.09754133],[0.6965558, -0.50331812, 0.5584839, 1.54375663, 0],[1.2311610, -0.34232368, -0.8102688, -0.82006429, -0.13256942],[0.2664415, 0.14486388, 0, 0, -2.24087863]])
     # bscale = BiScaler(scale_rows=False,scale_columns=False)

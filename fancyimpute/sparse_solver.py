@@ -267,24 +267,10 @@ class Solver(object):
         else:
             # For Sparse Matrices
             X_result_svd = self.solve(X_filled, X_original=X_original)
-            X_result = X_result_svd[0].dot(np.diag(X_result_svd[1]).dot(X_result_svd[2].T))
-            #X_result = X_result_svd
+            #X_result = X_result_svd[0].dot(np.diag(X_result_svd[1]).dot(X_result_svd[2].T))
+            X_result = X_result_svd
 
         return X_result
-
-    def predict(self, rows, cols):
-        """ Predict for one or many items
-        nnz = X_sparse.nnz
-        res = np.zeros(nnz)
-        row_id, col_id, _ = missing_mask # row and column indices are drawn from missing_mask to avoid unnecessary conversion to COO format
-        targets = zip(row_id, col_id)
-        for idx, (r, c) in enumerate(targets):
-            #import ipdb; ipdb.set_trace()
-            res[idx] = np.sum(U[r]*s*V[:,c])
-            #print(res[idx])
-        return res
-        """ 
-        pass
 
     def multiple_imputations(self, X):
         """
