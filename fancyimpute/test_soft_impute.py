@@ -1,5 +1,5 @@
 import numpy as np
-from sparse_soft_impute import SoftImpute
+from sparse_soft_impute import SoftImpute, SPLR
 from scipy.sparse import coo_matrix, csr_matrix, csc_matrix, lil_matrix
 from sklearn.utils.testing import assert_raises, assert_equal, assert_array_equal
 import unittest
@@ -14,6 +14,7 @@ class TestPredict(unittest.TestCase):
         self.x = csr_matrix((data, (row, col)), shape=(5, 6))
         self.si = SoftImpute(fill_method='sparse')
         self.x_pred = self.si.complete(self.x)
+        self.splr = SPLR(self.si.prepare_input_data(self.x))
 
     def test_prepare_input_data(self):
         '''
@@ -30,18 +31,101 @@ class TestPredict(unittest.TestCase):
             
     def test_fill(self):
         '''
-        For the spares setting, fill calls _preprocess_sparse(X). This
+        For the sparse setting, fill calls _preprocess_sparse(X). This
         test ensures the preprocessing step works as expected, and outputs
         are of the expected dimensions.
         '''
         rows, cols, shape = self.si.missing_mask
         self.assertTrue(len(rows) == len(cols))
         self.assertTrue(len(shape) == 2)
-        U, D_sq, V = self.si.fill(self.x)
+        U, D_sq, V = self.si.fill(self.x, inplace=True)
         self.assertTrue(U.shape == (shape[0], self.si.max_rank))
         self.assertTrue(np.all(D_sq == np.ones(self.si.max_rank)))
         self.assertTrue(np.all(V == np.zeros((shape[1],self.si.max_rank))))
 
+    def test_UD(self):
+        U = np.ones((6,3))
+        D = np.ones(3)
+        m = 6
+        expected = np.ones((6,3))
+        self.assertTrue(np.all(expected == self.si._UD(U, D, m)))
+
+    def test_xhat_pred(self):
+        '''
+        Ensures that the first value outputted by _xhat_pred is 
+        equal to the first output from x_result_svd's recomposed 
+        output.
+        '''
+        x_result_svd = self.x_pred
+        x_dense = x_result_svd[0].dot(np.diag(x_result_svd[1]).dot(x_result_svd[2].T))
+        self.assertAlmostEqual(x_dense[0,0], self.si._xhat_pred(x_result_svd, self.x)[0], places=5)
+
+    def test_als_u_step(self):
+        '''
+        Tests that the output shapes are correct.
+        '''
+        V_expected_shape = (6,2)    
+        D_sq_expected_length = self.si.max_rank
+        output = self.si._als_u_step(self.x_pred, self.splr)
+        self.assertTrue(len(output[1]) == D_sq_expected_length)
+        self.assertTrue(output[0].shape == V_expected_shape)
+
+    def test_als_v_step(self):
+        '''
+        Tests that the output shapes are correct.
+        '''
+        us, d_sqs, vs = (5,2), 2, (6,2)
+        output = self.si._als_v_step(self.x_pred, self.splr)
+        self.assertTrue(output[0].shape == us)
+        self.assertTrue(len(output[1]) == 2)
+        self.assertTrue(output[2].shape == vs)
+    
+    def test_fnorm(self):
+        '''
+        Calculated Frobenius Norm by hand, ensured matching results 
+        '''
+        output = self.si._fnorm(self.si.fill(self.x), self.x_pred) 
+        expected_output = 120.53 
+        self.assertAlmostEqual(expected_output, output, places=2)
+
+    def test_als_cleanup_step(self):
+        '''
+        Tests that the output shapes are correct.
+        '''
+        Us, D_sqs, Vs = (5,2), 2, (6,2)
+        output = self.si._als_cleanup_step(self.x_pred, self.splr)
+        self.assertTrue(output[0].shape == Us)
+        self.assertTrue(len(output[1]) == 2)
+        self.assertTrue(output[2].shape == Vs)
+        
+    def test_als_step(self):
+        '''
+        Ensure that X_fill_svd is updating, and that shapes remain
+        correct.
+        '''
+        output = self.si._als_step(self.x_pred, self.splr)
+        Uo, so, Vo = self.x_pred
+        U, s, V = output
+        self.assertTrue(U.shape == Uo.shape)
+        self.assertTrue(V.shape == Vo.shape)
+        self.assertFalse(np.all(s == so))
+        self.assertFalse(np.all(U == Uo))
+        self.assertFalse(np.all(V == Vo))
+        
+    def test_solve(self):
+        '''
+        Ensure shape of output is correct.
+        '''
+        output = self.si.solve(self.x_pred, self.x)
+        U, s, V = output
+        Uo, so, Vo = self.x_pred
+
+        self.assertTrue(U.shape == Uo.shape)
+        self.assertTrue(V.shape == Vo.shape)
+        self.assertFalse(np.all(s == so))
+        self.assertFalse(np.all(U == Uo))
+        self.assertFalse(np.all(V == Vo))
+        
     def test_predict_one(self):
         self.assertEqual(self.si.predict(1,1), 7)
         self.assertNotEqual(self.si.predict(0,1), 0)

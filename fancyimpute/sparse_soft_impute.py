@@ -16,7 +16,8 @@ from six.moves import range
 import numpy as np
 from numpy.random import RandomState
 from sklearn.utils.extmath import randomized_svd
-from scipy.sparse import coo_matrix, csc_matrix, issparse
+from scipy.sparse import coo_matrix, csc_matrix, issparse, csr_matrix
+from sklearn.metrics import mean_squared_error
 
 from biscaler import BiScaler
 #from .common import masked_mae
@@ -245,7 +246,6 @@ class SoftImpute(Solver):
         if self.shrinkage_value > 0:
             B = self._UD(B, D_sq / (D_sq + self.shrinkage_value), self.m)
         V, D_sq, _ = self._svd(B) # V is set to the U slot from V's SVD on purpose
-
         return V, D_sq
 
     def _als_v_step(self, X_fill_svd, X_prev):
@@ -268,7 +268,7 @@ class SoftImpute(Solver):
         D_sq = np.clip(D_sq - self.shrinkage_value, a_min=0, a_max=None) # this shrinks the singular values by lambda and clips them at zero
         return U, D_sq, V
 
-    def _als(self, X_fill_svd, X_prev):
+    def _als_step(self, X_fill_svd, X_prev):
         for i in range(self.max_iters):
             U, D_sq, V = X_fill_svd
             U_old, D_sq_old, V_old = U.copy(), D_sq.copy(), V.copy()
@@ -291,7 +291,6 @@ class SoftImpute(Solver):
         X : 3-d or 2-d array
             X is a simple 2-d array if the input is dense. 
             X is a 3-d array composed of a U matrix, a D singular values array, and a V matrix if the input is sparse.
-
         """
         self.X_fill = X
         self.X = X_original
@@ -342,7 +341,7 @@ class SoftImpute(Solver):
                     x_res.data = X_original.data - x_hat # TODO - this may not work if .data isn't a type for the input data source. Also, can the input source data be overwritten like this?
                     X_filled = SPLR(x_res, U, BD)
 
-                X_fill_svd = self._als(X_fill_svd, X_filled)
+                X_fill_svd = self._als_step(X_fill_svd, X_filled)
                 converged = self._converged(X_fill_svd_old, X_fill_svd)
 
                 if converged:
@@ -410,13 +409,21 @@ class SoftImpute(Solver):
                 res[idx] = self.predict(r, c)
             return res
 
+    def score(self):
+        """
+        Evaluate Root Mean Squared Error of Reconstructed X
+        """
+        xhat = self._xhat_pred(self.X_fill, self.X)
+        x = self.X.data
+        mse = mean_squared_error(x, xhat)
+        return np.sqrt(mse)
                 
 if __name__ == '__main__':
     # original version - mat = np.array([[0.8654889, 0.01565179, 0.1747903, 0, 0],[-0.6004172, 0, -0.2119090, 0, 0],[-0.7169292, 0, 0, 0.06437356, -0.09754133],[0.6965558, -0.50331812, 0.5584839, 1.54375663, 0],[1.2311610, -0.34232368, -0.8102688, -0.82006429, -0.13256942],[0.2664415, 0.14486388, 0, 0, -2.24087863]])
     # bscale = BiScaler(scale_rows=False,scale_columns=False)
     # xsc = bscale.fit_transform(mat)
     xsc = np.array([[ 0.1390011, -0.09270246, -0.04629866, 0, 0], [-0.4469535, 0,  0.44695354, 0, 0], [-0.8252855, 0, 0,  0.1160078,  0.7092777], [-0.1981945, -0.7993484,  0.16913247,  0.8089969, 0], [ 0.9662344,  0.01088327, -0.56979652, -0.9250004,  0.5176792], [ 0.3651963,  0.86175224, 0, 0, -1.2269486]])
-    x_orig = csc_matrix(xsc)
+    x_orig = csr_matrix(xsc)
     sf = SoftImpute(max_rank=3, shrinkage_value=1, fill_method='sparse')
    # X_original, missing_mask = sf.prepare_input_data(x_orig)
    # X_svd = sf.fill(X_original, missing_mask, inplace=True)
