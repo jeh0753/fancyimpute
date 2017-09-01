@@ -11,6 +11,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
 from collections import Counter
+#from fancyimpute import BiScaler
+from sparse_biscale import BiScale
 import random
 
 #from keras.regularizers import l2
@@ -74,7 +76,6 @@ class MaskData(object):
         mat = self.mat
         mat = mat.tocoo()
         mat_row, mat_col = mat.row, mat.col
-        print(mat_row, mat_col)
         # we need to convert these numbers back to the original dataset's column and row indices
         mat_zip = zip(mat_row, mat_col)
         for idx, (row_val, col_val) in enumerate(mat_zip):
@@ -85,6 +86,16 @@ class MaskData(object):
         self.test_data = random.sample(mat_zip, k) 
         return self
 
+    def _convert_test_points(self, zipped_test):
+        c_res = np.empty(len(zipped_test))
+        r_res = np.empty(len(zipped_test)) 
+
+        for idx, (r, c) in enumerate(zipped_test):
+            c_res[idx] = c
+            r_res[idx] = r
+
+        return r_res.astype(int), c_res.astype(int)
+           
     def mask(self):
         self.get_test_data()
         test_data = self.test_data
@@ -97,32 +108,45 @@ class MaskData(object):
         train_set = self.original.copy()
         train_set.data[mask == 0] = 0 
         train_set.eliminate_zeros()
-        self.train_set = train_set
         test_set = self.original
-        self.masked = mask
-        return train_set, self.original 
+        print(test_data)
+        test_data = self._convert_test_points(test_data)
+        return train_set, self.original, test_data 
 
 
-def load_movielens(path, leave_n_out=5):
+def load_movielens(path, leave_n_out=3):
     np.random.seed(0)
-    df = pd.read_csv(path).sample(5000, random_state=0)   
+    df = pd.read_csv(path).sample(1000, random_state=2)   
     n = len(df)
     row = np.array(df.userId)
     col = np.array(df.movieId)
     data = np.array(df.rating)
     mat = coo_matrix((data, (row, col)))
-#    import ipdb; ipdb.set_trace()
     masker = MaskData(mat, leave_n_out)
-    train, test = masker.mask()
-    return train, test
+    train, test, test_data_points = masker.mask()
+    return train, test, test_data_points 
 
-def gpredict(train):
+#def biscale(train):
+#    bisc = BiScaler()
+#    return bisc.fit_transform(train)
+def gpredict(train, test_data_points):
     c = coo_matrix(train)
     sf = graphlab.SFrame({'row': c.row, 'col': c.col, 'data': c.data})
     sf_small = sf.dropna('data', how="all")
-    m1 = graphlab.factorization_recommender.create(sf_small, user_id='row', item_id='col', target='data')
-    spred = m1.predict(sf)
-    pred = spred.to_numpy().reshape(train.shape[0],train.shape[1])
+    sf_topredict = graphlab.SFrame({'row': test_data_points[0], 'col': test_data_points[1]})
+    m1 = graphlab.factorization_recommender.create(sf_small, user_id='row', item_id='col', target='data', verbose=False)
+    spred = m1.predict(sf_topredict)
+    pred = spred.to_numpy()
+    return pred
+
+def my_predict(train, test_data_points):
+    #train = csr_matrix(train)
+    bs = BiScale(train)
+    train = bs.solve()
+    si = SoftImpute(max_rank=4, shrinkage_value=1, fill_method='sparse')
+    si.complete(train)
+    print(si._pred_sparse(test_data_points[0], test_data_points[1], si.X_filled))
+    pred = si.predict_many(test_data_points[0], test_data_points[1]) 
     return pred
 
 def embedding_input(name, n_in, n_out, reg):
@@ -159,7 +183,7 @@ def compute_bench(path, n_iter=3):
     results = defaultdict(lambda: [])
 
     for i in xrange(n_iter):
-        train, test = load_movielens(path, seed=i)
+        train, test, test_data_points  = load_movielens(path, seed=i)
         mask = (test != 0)
 
         it += 1
@@ -240,4 +264,13 @@ if __name__ == '__main__':
    # results, train, test = compute_bench('movielens.csv', n_iter=3)
    # plot_results(results)
     path = 'movielens.csv'
-    print load_movielens(path)
+    train, test, testdatapoints = load_movielens(path)
+    #print gpredict(train, testdatapoints)
+    #train = train.toarray()
+    #bis = biscale(train)
+    #print my_predict(train, testdatapoints)
+    #bis_masked = bis * (train != 0)
+    #cbis = csr_matrix(bis_masked)
+    print gpredict(train, testdatapoints)
+    print my_predict(train, testdatapoints)
+    #print bis

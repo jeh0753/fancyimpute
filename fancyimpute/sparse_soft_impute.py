@@ -19,7 +19,7 @@ from sklearn.utils.extmath import randomized_svd
 from scipy.sparse import coo_matrix, csc_matrix, issparse, csr_matrix
 from sklearn.metrics import mean_squared_error
 
-from biscaler import BiScaler
+from sparse_biscale import BiScale
 #from .common import masked_mae
 from sparse_solver import Solver
 
@@ -378,20 +378,32 @@ class SoftImpute(Solver):
 #                X_new=X_reconstruction,
 #                missing_mask=missing_mask)
 #            X_filled[missing_mask] = X_reconstruction[missing_mask]
+    def scale_and_center(self, row_id, col_id, prediction):
+        ''' takes a single predicted value, and returns the scaled and centered version. '''
+        scaled = prediction * self.X.row_scale[row_id] * self.X.col_scale[col_id]
+        centered = scaled + self.X.row_center[row_id] + self.X.col_center[col_id]
+        return centered
+         
 
     def predict(self, row_id, col_id):
         irows, icols, _ = self.missing_mask
         existing = zip(irows, icols)
+
         if isinstance(row_id, (int, long)) and isinstance(col_id, (int, long)):
             if (row_id, col_id) in existing:
-                return self.X[row_id, col_id]
+                prediction = self.X[row_id, col_id]
+                return self.scale_and_center(row_id, col_id, prediction)
+
             elif col_id < self.m and row_id < self.n:
-                return self._pred_sparse(row_id, col_id, self.X_fill)
+                prediction = self._pred_sparse(row_id, col_id, self.X_fill)
+                return self.scale_and_center(row_id, col_id, prediction)
+                
             else:
-                    if col_id >= self.m:
-                        raise ValueError("Column index %s is out of range" % (col_id))
-                    if row_id >= self.n:
-                        raise ValueError("Row index %s is out of range" % (row_id))
+                if col_id >= self.m:
+                    raise ValueError("Column index %s is out of range" % (col_id))
+                if row_id >= self.n:
+                    raise ValueError("Row index %s is out of range" % (row_id))
+
         else:
             raise ValueError("Input to predict must be two integers. Use predict_many to predict for multiple index pairs at once")
 
@@ -405,7 +417,7 @@ class SoftImpute(Solver):
         elif self.fill_method == "sparse":
             targets = zip(row_ids, col_ids)
             res = np.empty(len(targets))
-            for idx, (r, c) in enumerate(targets):
+            for idx, (r, c) in enumerate(targets): # TODO- this could be made into a matrix multiplication, which would add some speed
                 res[idx] = self.predict(r, c)
             return res
 
@@ -422,8 +434,18 @@ if __name__ == '__main__':
     # original version - mat = np.array([[0.8654889, 0.01565179, 0.1747903, 0, 0],[-0.6004172, 0, -0.2119090, 0, 0],[-0.7169292, 0, 0, 0.06437356, -0.09754133],[0.6965558, -0.50331812, 0.5584839, 1.54375663, 0],[1.2311610, -0.34232368, -0.8102688, -0.82006429, -0.13256942],[0.2664415, 0.14486388, 0, 0, -2.24087863]])
     # bscale = BiScaler(scale_rows=False,scale_columns=False)
     # xsc = bscale.fit_transform(mat)
+    '''
     xsc = np.array([[ 0.1390011, -0.09270246, -0.04629866, 0, 0], [-0.4469535, 0,  0.44695354, 0, 0], [-0.8252855, 0, 0,  0.1160078,  0.7092777], [-0.1981945, -0.7993484,  0.16913247,  0.8089969, 0], [ 0.9662344,  0.01088327, -0.56979652, -0.9250004,  0.5176792], [ 0.3651963,  0.86175224, 0, 0, -1.2269486]])
     x_orig = csr_matrix(xsc)
+    '''
+
+    x =  np.array([0.86548894, -0.60041722, -0.71692924,  0.69655580,  1.23116102,  0.26644155,  0.01565179, -0.50331812, -0.34232368,  0.14486388,  0.17479031, -0.21190900,  0.55848392, -0.81026875, 0.06437356,  1.54375663, -0.82006429, -0.09754133, -0.13256942, -2.24087863])
+    x_idx = np.array([0, 1, 2, 3, 4, 5, 0, 3, 4, 5, 0, 1, 3, 4, 2, 3, 4, 2, 4, 5]) 
+    x_p = np.array([0, 6, 10, 14, 17, 20])
+    xs = csc_matrix((x, x_idx, x_p), shape=(6,5))
+    bs = BiScale(xs)
+    x_in = bs.solve()
+
     sf = SoftImpute(max_rank=3, shrinkage_value=1, fill_method='sparse')
    # X_original, missing_mask = sf.prepare_input_data(x_orig)
    # X_svd = sf.fill(X_original, missing_mask, inplace=True)
@@ -436,7 +458,8 @@ if __name__ == '__main__':
    # X_original = SPLR(x_res, U, BD)
    # sf._als_step(x_svd, x_original)
 #    import ipdb; ipdb.set_trace()
-    sf.single_imputation(x_orig)
+    sf.single_imputation(x_in)
+    print(sf.predict_many(np.array([2,3]), np.array([2,2])))
 
 
 
