@@ -380,6 +380,7 @@ class SoftImpute(Solver):
 #            X_filled[missing_mask] = X_reconstruction[missing_mask]
     def scale_and_center(self, row_id, col_id, prediction):
         ''' takes a single predicted value, and returns the scaled and centered version. '''
+        #print(self.X.row_center[row_id], self.X.col_center[col_id])
         scaled = prediction * self.X.row_scale[row_id] * self.X.col_scale[col_id]
         centered = scaled + self.X.row_center[row_id] + self.X.col_center[col_id]
         return centered
@@ -459,7 +460,7 @@ if __name__ == '__main__':
    # sf._als_step(x_svd, x_original)
 #    import ipdb; ipdb.set_trace()
     sf.single_imputation(x_in)
-    print(sf.predict_many(np.array([2,3]), np.array([2,2])))
+    print(sf.predict_many(np.array([1,2]), np.array([1,1])))
 
 
 

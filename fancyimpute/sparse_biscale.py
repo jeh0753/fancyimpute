@@ -60,7 +60,7 @@ class BiScale(object):
         icol = coo_x.col
         #import ipdb; ipdb.set_trace()
         suvc1 = self._c_suvc(a, b, irow, icol)  
-        suvc2 = self._c_suvc(self.tau.reshape(-1,1), self.tau.reshape(-1,1), irow, icol)
+        suvc2 = self._c_suvc(self.tau.reshape(-1,1), self.gamma.reshape(-1,1), irow, icol)
         self.xhat.data = (x-suvc1) / suvc2
         #b_center = suvc(nnrow, nncol,nrank, self.tau, self.gamma, self.x.indices, self.x.indptr, nomega)  
         #nnrow,nncol,nrank,u,v,irow,pcol,nomega
@@ -86,6 +86,7 @@ class BiScale(object):
                 gamma_by_sum = np.multiply(colsums,(self.gamma))
                 dbeta = gamma_by_sum / self._col_sum_along(1 / self.tau, self.x)
                 self.b = self.b + dbeta
+                self.b[np.isnan(self.b)] = 0
                 self._center_scale_I()
             else:
                 dbeta = 0
@@ -96,12 +97,15 @@ class BiScale(object):
                 tau_by_sum = np.multiply(self.tau, rowsums)
                 dalpha = tau_by_sum / self._row_sum_along(1 / self.gamma, self.x)
                 self.a = self.a + dalpha
+                self.a[np.isnan(self.a)] = 0
                 self._center_scale_I()
 
             else:
                 dalpha = 0 
         
             #Leaving out scaling for now; does not appear to be used for my purposes
+            dalpha[np.isnan(dalpha)] = 0
+            dbeta[np.isnan(dbeta)] = 0
             convergence_level = np.square(dalpha).sum() + np.square(dbeta).sum()
             self.critmat.append([i + 1, convergence_level])
             if convergence_level < self.thresh:

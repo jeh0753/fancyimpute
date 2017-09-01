@@ -89,12 +89,14 @@ class MaskData(object):
     def _convert_test_points(self, zipped_test):
         c_res = np.empty(len(zipped_test))
         r_res = np.empty(len(zipped_test)) 
+        x_res = np.empty(len(zipped_test))
 
         for idx, (r, c) in enumerate(zipped_test):
             c_res[idx] = c
             r_res[idx] = r
+            x_res[idx] = self.original.tocsr()[r,c]
 
-        return r_res.astype(int), c_res.astype(int)
+        return (r_res.astype(int), c_res.astype(int)), x_res
            
     def mask(self):
         self.get_test_data()
@@ -110,12 +112,12 @@ class MaskData(object):
         train_set.eliminate_zeros()
         test_set = self.original
         print(test_data)
-        test_data = self._convert_test_points(test_data)
-        return train_set, self.original, test_data 
+        test_data, test_results = self._convert_test_points(test_data)
+        return train_set, self.original, test_data, test_results 
+ 
 
-
-def load_movielens(path, leave_n_out=3):
-    np.random.seed(0)
+def load_movielens(path, leave_n_out=3, seed=0):
+    np.random.seed(seed)
     df = pd.read_csv(path).sample(1000, random_state=2)   
     n = len(df)
     row = np.array(df.userId)
@@ -123,8 +125,8 @@ def load_movielens(path, leave_n_out=3):
     data = np.array(df.rating)
     mat = coo_matrix((data, (row, col)))
     masker = MaskData(mat, leave_n_out)
-    train, test, test_data_points = masker.mask()
-    return train, test, test_data_points 
+    train, test, test_data_points, test_results = masker.mask()
+    return train, test, test_data_points, test_results 
 
 #def biscale(train):
 #    bisc = BiScaler()
@@ -140,12 +142,12 @@ def gpredict(train, test_data_points):
     return pred
 
 def my_predict(train, test_data_points):
-    #train = csr_matrix(train)
+    train = csr_matrix(train)
     bs = BiScale(train)
     train = bs.solve()
-    si = SoftImpute(max_rank=4, shrinkage_value=1, fill_method='sparse')
+    si = SoftImpute(max_rank=5, shrinkage_value=2, fill_method='sparse')
     si.complete(train)
-    print(si._pred_sparse(test_data_points[0], test_data_points[1], si.X_filled))
+    #print(si._pred_sparse(test_data_points[0], test_data_points[1], si.X_filled))
     pred = si.predict_many(test_data_points[0], test_data_points[1]) 
     return pred
 
@@ -183,7 +185,7 @@ def compute_bench(path, n_iter=3):
     results = defaultdict(lambda: [])
 
     for i in xrange(n_iter):
-        train, test, test_data_points  = load_movielens(path, seed=i)
+        train, test, test_data_points, test_results = load_movielens(path, seed=i)
         mask = (test != 0)
 
         it += 1
@@ -191,32 +193,23 @@ def compute_bench(path, n_iter=3):
         print('Iteration %03d of %03d' % (i+1, n_iter))
         print('====================')
 
-        gc.collect()
-        print("benchmarking FactorizationImputer: ")
-        tstart = time()
-        imp = FactorizationImputer(normalizer=BiScaler(), verbose=False)#may need to add some variables here
-        pred = imp.fit_transform(train)
-        pred *= mask
-        mse = mean_squared_error(test, pred)
-        results['FactorizationImputer'].append((time() - tstart, mse))
+       # gc.collect()
+       # print("benchmarking Imputer using mean: ")
+       # tstart = time()
+       # imp = Imputer(strategy='mean')
+       # pred = imp.fit_transform(train)
+       # pred *= mask
+       # mse = mean_squared_error(test, pred)
+       # results['Mean Imputer'].append((time() - tstart, mse))
 
-        gc.collect()
-        print("benchmarking Imputer using mean: ")
-        tstart = time()
-        imp = Imputer(strategy='mean')
-        pred = imp.fit_transform(train)
-        pred *= mask
-        mse = mean_squared_error(test, pred)
-        results['Mean Imputer'].append((time() - tstart, mse))
-
-        gc.collect()
-        print("benchmarking Imputer using most frequent value: ")
-        tstart = time()
-        imp = Imputer(strategy='most_frequent')
-        pred = imp.fit_transform(train)
-        pred *= mask
-        mse = mean_squared_error(test, pred)
-        results['Most Frequent Value Imputer'].append((time() - tstart, mse))
+       # gc.collect()
+       # print("benchmarking Imputer using most frequent value: ")
+       # tstart = time()
+       # imp = Imputer(strategy='most_frequent')
+       # pred = imp.fit_transform(train)
+       # pred *= mask
+       # mse = mean_squared_error(test, pred)
+       # results['Most Frequent Value Imputer'].append((time() - tstart, mse))
 
         #gc.collect()
         #print("benchmarking Imputer using Neural Net: ")
@@ -230,10 +223,16 @@ def compute_bench(path, n_iter=3):
         gc.collect()
         print("benchmarking GraphLab: ")
         tstart = time()
-        pred = gpredict(train)
-        pred *= mask
-        mse = mean_squared_error(test, pred)
+        pred = gpredict(train, test_data_points)
+        mse = mean_squared_error(test_results, pred)
         results['GraphLab'].append((time() - tstart, mse))
+
+        gc.collect()
+        print("benchmarking SoftImputeALS: ")
+        tstart = time()
+        pred = my_predict(train, test_data_points)
+        mse = mean_squared_error(test_results, pred)
+        results['SoftImputeALS'].append((time() - tstart, mse))
 
     return results, train, test
 
@@ -264,13 +263,15 @@ if __name__ == '__main__':
    # results, train, test = compute_bench('movielens.csv', n_iter=3)
    # plot_results(results)
     path = 'movielens.csv'
-    train, test, testdatapoints = load_movielens(path)
+    results, train, test =  compute_bench(path, n_iter=10)
+    plot_results(results)
+    #train, test, testdatapoints = load_movielens(path)
     #print gpredict(train, testdatapoints)
     #train = train.toarray()
     #bis = biscale(train)
     #print my_predict(train, testdatapoints)
     #bis_masked = bis * (train != 0)
     #cbis = csr_matrix(bis_masked)
-    print gpredict(train, testdatapoints)
-    print my_predict(train, testdatapoints)
+    #print gpredict(train, testdatapoints)
+    #print my_predict(train, testdatapoints)
     #print bis
