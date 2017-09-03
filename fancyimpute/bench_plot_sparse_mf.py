@@ -4,6 +4,7 @@ import graphlab
 from collections import defaultdict
 import gc
 from sparse_soft_impute import SoftImpute
+from sparse_als_soft_impute import SparseSoftImputeALS
 from time import time
 from sklearn.preprocessing.imputation import Imputer
 from scipy.sparse import coo_matrix, csr_matrix, csc_matrix
@@ -12,7 +13,7 @@ from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
 from collections import Counter
 #from fancyimpute import BiScaler
-from sparse_biscale import BiScale
+from sparse_biscale import SBiScale
 import random
 
 #from keras.regularizers import l2
@@ -116,9 +117,9 @@ class MaskData(object):
         return train_set, self.original, test_data, test_results 
  
 
-def load_movielens(path, leave_n_out=3, seed=0):
+def load_movielens(path, leave_n_out=3, sample=1000, seed=0):
     np.random.seed(seed)
-    df = pd.read_csv(path).sample(1000, random_state=2)   
+    df = pd.read_csv(path).sample(sample, random_state=2)   
     n = len(df)
     row = np.array(df.userId)
     col = np.array(df.movieId)
@@ -131,24 +132,40 @@ def load_movielens(path, leave_n_out=3, seed=0):
 #def biscale(train):
 #    bisc = BiScaler()
 #    return bisc.fit_transform(train)
-def gpredict(train, test_data_points):
+def gSGD_predict(train, test_data_points):
     c = coo_matrix(train)
     sf = graphlab.SFrame({'row': c.row, 'col': c.col, 'data': c.data})
     sf_small = sf.dropna('data', how="all")
     sf_topredict = graphlab.SFrame({'row': test_data_points[0], 'col': test_data_points[1]})
-    m1 = graphlab.factorization_recommender.create(sf_small, user_id='row', item_id='col', target='data', verbose=False)
+    m1 = graphlab.factorization_recommender.create(sf_small, user_id='row', item_id='col', solver='sgd', target='data', verbose=False)
     spred = m1.predict(sf_topredict)
     pred = spred.to_numpy()
     return pred
 
-def my_predict(train, test_data_points):
+def gALS_predict(train, test_data_points):
+    c = coo_matrix(train)
+    sf = graphlab.SFrame({'row': c.row, 'col': c.col, 'data': c.data})
+    sf_small = sf.dropna('data', how="all")
+    sf_topredict = graphlab.SFrame({'row': test_data_points[0], 'col': test_data_points[1]})
+    m1 = graphlab.factorization_recommender.create(sf_small, user_id='row', item_id='col', solver='als', target='data', verbose=False)
+    spred = m1.predict(sf_topredict)
+    pred = spred.to_numpy()
+    return pred
+
+def softALS_predict(train, test_data_points):
     train = csr_matrix(train)
-    bs = BiScale(train)
-    train = bs.solve()
-    si = SoftImpute(max_rank=5, shrinkage_value=2, fill_method='sparse')
+    si = SparseSoftImputeALS(max_rank=2, shrinkage_value=None)
     si.complete(train)
     #print(si._pred_sparse(test_data_points[0], test_data_points[1], si.X_filled))
-    pred = si.predict_many(test_data_points[0], test_data_points[1]) 
+    pred = si.predict(test_data_points[0], test_data_points[1]) 
+    return pred
+
+def softSVD_predict(train, test_data_points):
+    train = csr_matrix(train)
+    si = SoftImpute(max_rank=2, shrinkage_value=None)
+    si.complete(train)
+    #print(si._pred_sparse(test_data_points[0], test_data_points[1], si.X_filled))
+    pred = si.predict(test_data_points[0], test_data_points[1]) 
     return pred
 
 def embedding_input(name, n_in, n_out, reg):
@@ -178,14 +195,14 @@ def neural_net(train):
     pred = pred.reshape(train.shape[0], train.shape[1])
     return pred
 
-def compute_bench(path, n_iter=3):
+def compute_bench(path, n_iter=3, leave_n_out=3, sample=1000):
 
     it = 0
 
     results = defaultdict(lambda: [])
 
     for i in xrange(n_iter):
-        train, test, test_data_points, test_results = load_movielens(path, seed=i)
+        train, test, test_data_points, test_results = load_movielens(path, seed=i+10, leave_n_out=leave_n_out, sample=sample)
         mask = (test != 0)
 
         it += 1
@@ -220,25 +237,43 @@ def compute_bench(path, n_iter=3):
         #mse = mean_squared_error(test, pred)
         #results['Neural Network'].append((time() - tstart, mse))
 
+        t1 = train.copy()
         gc.collect()
-        print("benchmarking GraphLab: ")
+        print("benchmarking GraphLabSGD: ")
         tstart = time()
-        pred = gpredict(train, test_data_points)
+        pred = gSGD_predict(t1, test_data_points)
         mse = mean_squared_error(test_results, pred)
-        results['GraphLab'].append((time() - tstart, mse))
+        results['GraphLab SGD'].append((time() - tstart, mse))
 
+        t2 = train.copy()
+        gc.collect()
+        print("benchmarking GraphLabALS: ")
+        tstart = time()
+        pred = gALS_predict(t2, test_data_points)
+        mse = mean_squared_error(test_results, pred)
+        results['GraphLab ALS'].append((time() - tstart, mse))
+
+        t3 = train.copy()
+        gc.collect()
+        print("benchmarking SoftImputeSVD: ")
+        tstart = time()
+        pred = softSVD_predict(t3, test_data_points)
+        mse = mean_squared_error(test_results, pred)
+        results['SoftImputeSVD'].append((time() - tstart, mse))
+
+        t4 = train.copy()
         gc.collect()
         print("benchmarking SoftImputeALS: ")
         tstart = time()
-        pred = my_predict(train, test_data_points)
+        pred = softALS_predict(t4, test_data_points)
         mse = mean_squared_error(test_results, pred)
         results['SoftImputeALS'].append((time() - tstart, mse))
 
     return results, train, test
 
-def plot_results(results):
-    mse = dict()
-    time = dict()
+def compute_avgs(results, mse=defaultdict(list), time=defaultdict(list)):
+    mse = mse
+    time = time 
     for k, v in results.iteritems():
         avg_time = []
         avg_mse = []
@@ -247,8 +282,39 @@ def plot_results(results):
             avg_mse.append(t[1])
         avg_time = np.mean(avg_time)
         avg_mse = np.mean(avg_mse)
-        mse[k] = avg_mse
-        time[k] = avg_time
+        mse[k].append(avg_mse)
+        time[k].append(avg_time)
+    return mse, time
+
+def plot_over_samples(path):
+    n_range = np.linspace(1000, 100000, 3)
+    mse_results = np.empty(len(n_range))
+    time_results = np.empty(len(n_range))
+    mse = defaultdict(list)
+    time = defaultdict(list)
+
+    for idx, s in enumerate(n_range):
+        print('==========================')
+        print('Round %03d of %03d' % (idx+1, len(n_range)))
+        print('==========================')
+        result, train, test = compute_bench(path, n_iter=3, leave_n_out=3, sample=s)
+        mse, time = compute_avgs(result, mse=mse, time=time)
+
+    plt.clf()
+    f, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
+    model_range = range(len(mse.values()))
+    for idx, model in enumerate(model_range): 
+        ax1.plot(n_range, mse.values()[idx], label=mse.keys()[idx])
+    for idx, model in enumerate(model_range):
+        ax2.plot(n_range, time.values()[idx], label=time.keys()[idx])
+    ax1.set_title("Mean Squared Error Each Model")
+    ax2.set_title("Time To Run Each Model")
+    #plt.xticks(range(len(time)), n_range)
+    plt.legend()
+    plt.show()
+    
+def plot_results(results):
+    mse, time = compute_avgs(results)
     plt.clf()
     f, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
     ax1.bar(range(len(mse)), mse.values(), align='center')
@@ -263,8 +329,8 @@ if __name__ == '__main__':
    # results, train, test = compute_bench('movielens.csv', n_iter=3)
    # plot_results(results)
     path = 'movielens.csv'
-    results, train, test =  compute_bench(path, n_iter=10)
-    plot_results(results)
+    #results, train, test =  compute_bench(path, n_iter=10)
+    plot_over_samples(path)
     #train, test, testdatapoints = load_movielens(path)
     #print gpredict(train, testdatapoints)
     #train = train.toarray()

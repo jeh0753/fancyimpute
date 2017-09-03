@@ -14,7 +14,8 @@ from __future__ import absolute_import, print_function, division
 
 import numpy as np
 from six.moves import range
-from scipy.sparse import issparse, coo_matrix
+from scipy.sparse import issparse, coo_matrix, csr_matrix
+from sparse_biscale import SBiScale
 
 #from .common import generate_random_column_samples
 
@@ -22,31 +23,22 @@ from scipy.sparse import issparse, coo_matrix
 class Solver(object):
     def __init__(
             self,
-            fill_method="zero",
             n_imputations=1,
             min_value=None,
             max_value=None,
             max_rank=None,
-            normalizer=None):
+            normalizer=None,
+            sparse=False):
         self.random = np.random.RandomState()
         self.random.seed(0)
-        self.fill_method = fill_method
         self.n_imputations = n_imputations
         self.min_value = min_value
         self.max_value = max_value
         self.max_rank = max_rank
         self.normalizer = normalizer
+        self.sparse = sparse
         self.missing_mask = None
-    """
-        fill_method : str
-            "zero": fill missing entries with zeros
-            "mean": fill with column means
-            "median" : fill with column medians
-            "min": fill with min value per column
-            "random": fill with gaussian samples according to mean/std of column
-            "sparse": process as a sparse matrix
 
-    """
     def __repr__(self):
         return str(self)
 
@@ -66,24 +58,25 @@ class Solver(object):
             raise ValueError("Expected 2d matrix, got %s array" % (X.shape,))
 
     def _check_missing_value_mask(self):
-        if self.fill_method != "sparse":
-            missing = self.missing_mask
-            if not missing.any():
-                raise ValueError("Input matrix is not missing any values")
-            if missing.all():
-                raise ValueError("Input matrix must have some non-missing values")
-        else:
+        if self.sparse:
             rows, cols, shape = self.missing_mask
             full_size = shape[0] * shape[1]
             if len(rows) == full_size:
                 raise ValueError("Input matrix is not missing any values")
             if len(rows) == 0:
                 raise ValueError("Input matrix must have some non-missing values")
+        else:
+            missing = self.missing_mask
+            if not missing.any():
+                raise ValueError("Input matrix is not missing any values")
+            if missing.all():
+                raise ValueError("Input matrix must have some non-missing values")
 
     def _check_max_rank(self, X):
         m, n = X.shape
-        full_rank = max(m, n)
+        full_rank = min(m, n)
         self.max_rank = min(self.max_rank, full_rank)
+        return self
 
     def _fill_columns_with_fn(self, X, col_fn):
         '''Note: this method is for dense X matrices only'''
@@ -113,21 +106,11 @@ class Solver(object):
 
         return (U, D_sq, V) # this may not work for copy step 
 
-    def _pred_sparse(self, row_id, col_id, X_svd):
-        """This function predicts output for a single row id
-        and column id pair. It returns prediction based on SVD
-        regardless of whether the row, column pair existed in 
-        the original matrix"""
-        U, s, V = X_svd
-        V = V.T
-        res = np.sum(U[row_id]*s*V[:,col_id])
-        return res
-
-
     def fill(
             self,
             X,
-            inplace=False):
+            inplace=False, 
+            fill_method=None):
         """
         Parameters
         ----------
@@ -136,14 +119,23 @@ class Solver(object):
 
         inplace : bool
             Modify matrix or fill a copy
+
+        fill_method : str
+            "zero": fill missing entries with zeros
+            "mean": fill with column means
+            "median" : fill with column medians
+            "min": fill with min value per column
+            "random": fill with gaussian samples according to mean/std of column
+            "sparse": process as a sparse matrix
         """
         if not inplace:
             X = X.copy()
 
-        fill_method = self.fill_method
         missing_mask = self.missing_mask
 
-        if fill_method not in ("zero", "mean", "median", "min", "random", "sparse"):
+        if self.sparse:
+            X = self._preprocess_sparse(X)
+        elif fill_method not in ("zero", "mean", "median", "min", "random"):
             raise ValueError("Invalid fill method: '%s'" % (fill_method))
         elif fill_method == "zero":
             # replace NaN's with 0
@@ -158,8 +150,6 @@ class Solver(object):
             self._fill_columns_with_fn(
                 X,
                 col_fn=generate_random_column_samples)
-        elif fill_method == "sparse":
-            X = self._preprocess_sparse(X)
         return X
 
     def prepare_input_data(self, X):
@@ -167,7 +157,7 @@ class Solver(object):
         Check to make sure that the input matrix and its mask of missing
         values are valid. Returns X and missing mask.
         """
-        if self.fill_method == 'sparse':
+        if self.sparse:
             #TODO - separate out safety checks in _preprocess_sparse as well, and include them here instead
 
             self._check_input(X)
@@ -238,12 +228,21 @@ class Solver(object):
             self.__class__.__name__,))
 
     def single_imputation(self, X):
+        if isinstance(self.normalizer, SBiScale):
+            X = csr_matrix(X)
+            X = self.normalizer.fit(X)
         X_original = self.prepare_input_data(X)
         missing_mask = self.missing_mask
         X = X_original.copy()
         X_filled = self.fill(X, inplace=True) #X_filled is a decomposed set of svd components if X is sparse. It is initialized randomly
 
-        if self.fill_method != 'sparse':
+        if self.sparse:
+            # For Sparse Matrices
+            X_result_svd = self.solve(X_filled, X_original=X_original)
+            #X_result = X_result_svd[0].dot(np.diag(X_result_svd[1]).dot(X_result_svd[2].T))
+            X_result = X_result_svd
+
+        else:
             observed_mask = ~missing_mask
             X_result = self.solve(X_filled, missing_mask)
 
@@ -264,12 +263,6 @@ class Solver(object):
             X_result = self.project_result(X=X_result)
             X_result[observed_mask] = X_original[observed_mask]
 
-        else:
-            # For Sparse Matrices
-            X_result_svd = self.solve(X_filled, X_original=X_original)
-            #X_result = X_result_svd[0].dot(np.diag(X_result_svd[1]).dot(X_result_svd[2].T))
-            X_result = X_result_svd
-
         return X_result
 
     def multiple_imputations(self, X):
@@ -277,7 +270,7 @@ class Solver(object):
         generate multiple imputations of the same incomplete matrix, if matrix is
         not sparse.
         """
-        if self.fill_method == "sparse":
+        if self.sparse:
             return [self.single_imputation(X)]
         else:
             return [self.single_imputation(X) for _ in range(self.n_imputations)]

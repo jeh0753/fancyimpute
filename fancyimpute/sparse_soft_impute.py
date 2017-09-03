@@ -19,63 +19,9 @@ from sklearn.utils.extmath import randomized_svd
 from scipy.sparse import coo_matrix, csc_matrix, issparse, csr_matrix
 from sklearn.metrics import mean_squared_error
 
-from sparse_biscale import BiScale
-#from .common import masked_mae
+from sparse_biscale import SBiScale
 from sparse_solver import Solver
-
-class SPLR(object):
-    
-    def __init__(self, x, a=None, b=None):
-        self.x = x
-        self.a = a
-        self.b = b
-
-        x_dims = x.shape
-
-        if a is None:
-            self.b = None
-
-        if b is None:
-            self.a = None
-        else:
-            a_dims = a.shape
-            b_dims = b.shape
-            if a_dims[0] != x_dims[0]:
-                raise ValueError("number of rows of x not equal to number of rows of a")
-
-            if b_dims[0] != x_dims[1]:
-                raise ValueError("number of columns of x not equal to number of rows of b")
-
-            if a_dims[1] != b_dims[1]:
-                raise ValueError("number of columns of a not equal to number of columns of b")
-
-    def r_mult(self, other):
-        """Left Multiplication
-        This is equivalent to self.dot(other)
-        """
-        result = self.x.dot(other)
-        result = result
-
-        if self.a is not None:
-            b_mult = self.b.T.dot(other)
-            ab_mult = self.a.dot(b_mult)
-            result += ab_mult
-
-        return result
-
-    def l_mult(self, other):
-        """Left Multiplication
-        This is equivalent to other.dot(self)
-        """
-        result = csc_matrix(other).dot(self.x) # conversion necessary for dot to be called successfully
-        result = result.toarray()
-
-        if self.a is not None:
-            ab_mult = other.dot(self.a)
-            ab_mult = ab_mult.dot(self.b.T)
-            result += ab_mult
-
-        return result
+from splr_matrix import SPLR
     
 
 class SoftImpute(Solver):
@@ -91,10 +37,7 @@ class SoftImpute(Solver):
             max_iters=100,
             max_rank=2, 
             n_power_iterations=8,
-            fill_method="zero",
-            min_value=None,
-            max_value=None,
-            normalizer=None,
+            center=True,
             verbose=True):
         """
         Parameters
@@ -119,29 +62,19 @@ class SoftImpute(Solver):
         n_power_iterations : int
             Number of power iterations to perform with randomized SVD
 
-        fill_method : str
-            How to initialize missing values of data matrix, default is
-            to fill them with zeros.
-
-        min_value : float
-            Smallest allowable value in the solution
-
-        max_value : float
-            Largest allowable value in the solution
-
-        normalizer : object
-            Any object (such as BiScaler) with fit() and transform() methods
+        normalizer : bool
+            Uses SBiScale(), if True. This centers and scales the data
 
         verbose : bool
             Print debugging info
         """
         Solver.__init__(
             self,
-            fill_method=fill_method,
-            min_value=min_value,
-            max_value=max_value,
+            min_value=None,
+            max_value=None,
             max_rank=max_rank,
-            normalizer=normalizer)
+            normalizer=SBiScale() if center == True else None,
+            sparse=True)
         self.shrinkage_value = shrinkage_value
         self.convergence_threshold = convergence_threshold
         self.max_iters = max_iters
@@ -152,15 +85,7 @@ class SoftImpute(Solver):
         self.n = None
         self.X = None
         self.svd = None
-
-#    def _converged(self, X_old, X_new, missing_mask):
-#        # check for convergence
-#        old_missing_values = X_old[missing_mask]
-#        new_missing_values = X_new[missing_mask]
-#        difference = old_missing_values - new_missing_values
-#        ssd = np.sum(difference ** 2)
-#        old_norm = np.sqrt((old_missing_values ** 2).sum())
-#        return (np.sqrt(ssd) / old_norm) < self.convergence_threshold
+        self.X_splr = None
 
     def _fnorm(self, SVD_old, SVD_new):
         # U, S, V is the order of SVD matrices. This function takes the Frobenius Norm of an SVD decomposed matrix.
@@ -183,10 +108,20 @@ class SoftImpute(Solver):
         ones = np.ones(n)
         return U * np.outer(ones, D)
 
-    def _xhat_pred(self, x_svd, x):
+    def _pred_sparse(self, row_id, col_id, X_svd):
+        """This function predicts output for a single row id
+        and column id pair. It returns prediction based on SVD
+        regardless of whether the row, column pair existed in 
+        the original matrix"""
+        U, s, V = X_svd
+        V = V.T
+        res = np.sum(U[row_id]*s*V[:,col_id])
+        return res
+
+    def _xhat_pred(self):
         """predicts x values for X original indices/columns"""
-        #TODO - get rid of the inputs here, use the self.x and self.svd
         row_ids, col_ids, _ = self.missing_mask
+        x_svd = self.X_fill
         targets = zip(row_ids, col_ids)
         n_preds = len(targets)
         res = np.empty(n_preds)
@@ -210,81 +145,60 @@ class SoftImpute(Solver):
                 full_matrices=False,
                 compute_uv=True)
 
-
-    def _svd_step(self, X, shrinkage_value):
-        """
-        Returns reconstructed X from low-rank thresholded SVD and
-        the rank achieved. Only for dense matrices
-        """
-        U, s, V = self._svd(X, self.max_rank)
-        s_thresh = np.maximum(s - shrinkage_value, 0)
-        rank = (s_thresh > 0).sum()
-        s_thresh = s_thresh[:rank]
-        U_thresh = U[:, :rank]
-        V_thresh = V[:rank, :]
-        s_thresh = np.diag(s_thresh)
-        X_reconstruction = np.dot(U_thresh, np.dot(S_thresh, V_thresh))
-        return X_reconstruction, rank
-
     def _max_singular_value(self):
         # quick decomposition of X_filled into rank-1 SVD
         X_filled = self.X_fill
-        if self.fill_method == 'sparse':
-            return X_filled[1][0] #TODO - Replace with self.svd, or rename if we want it to apply for else cond.
-        else:
-            _, s, _ = randomized_svd(
-                X_filled,
-                1,
-                n_iter=5)
-            return s[0]
+        return X_filled[1][0] #TODO - Replace with self.svd, or rename if we want it to apply for else cond.
 
-    def _als_u_step(self, X_fill_svd, X_prev):
-        U, D_sq, V = X_fill_svd
+    def _als_u_step(self):
+        U, D_sq, V = self.X_fill
 
-        B = (X_prev.l_mult(U.T)).T
+        B = (self.X_splr.l_mult(U.T)).T
 
         if self.shrinkage_value > 0:
             B = self._UD(B, D_sq / (D_sq + self.shrinkage_value), self.m)
         V, D_sq, _ = self._svd(B) # V is set to the U slot from V's SVD on purpose
-        return V, D_sq
+        self.X_fill = U, D_sq, V
+        return self 
 
-    def _als_v_step(self, X_fill_svd, X_prev):
-        U, D_sq, V = X_fill_svd
+    def _als_v_step(self):
+        U, D_sq, V = self.X_fill
 
-        A = X_prev.r_mult(V)
+        A = self.X_splr.r_mult(V)
 
         if self.shrinkage_value > 0:
             A = self._UD(A, D_sq / (D_sq + self.shrinkage_value), self.n)
 
         U, D_sq, V_part = self._svd(A)
         V = V.dot(V_part.T) # just for computing the convergence criterion
-        return U, D_sq, V
+        self.X_fill = U, D_sq, V
+        return self
 
-    def _als_cleanup_step(self, X_fill_svd, X_prev):
-        U, D_sq, V = X_fill_svd
-        A = X_prev.r_mult(V)
+    def _als_cleanup_step(self):
+        U, D_sq, V = self.X_fill
+        A = self.X_splr.r_mult(V)
         U, D_sq, V_part = self._svd(A) 
         V = V.dot(V_part.T)
         D_sq = np.clip(D_sq - self.shrinkage_value, a_min=0, a_max=None) # this shrinks the singular values by lambda and clips them at zero
-        return U, D_sq, V
+        self.X_fill = U, D_sq, V
+        return self
 
-    def _als_step(self, X_fill_svd, X_prev):
+    def _als_step(self):
         for i in range(self.max_iters):
-            U, D_sq, V = X_fill_svd
+            U, D_sq, V = self.X_fill
             U_old, D_sq_old, V_old = U.copy(), D_sq.copy(), V.copy()
-            V, D_sq = self._als_u_step(X_fill_svd, X_prev)
-            X_fill_svd = U, D_sq, V
-            U, D_sq, V = self._als_v_step(X_fill_svd, X_prev)
+            self._als_u_step()
+            self._als_v_step()
+            U, D_sq, V = self.X_fill
             converged = self._converged((U_old, D_sq_old, V_old), (U, D_sq, V))
-            X_fill_svd = (U, D_sq, V)
 
             if converged:
                 break
 
         if self.shrinkage_value > 0:
-            X_fill_svd = self._als_cleanup_step(X_fill_svd, X_prev) 
+            self._als_cleanup_step() 
 
-        return X_fill_svd
+        return self
 
     def solve(self, X, X_original=None):
         """
@@ -303,7 +217,6 @@ class SoftImpute(Solver):
         if X_original is not None:
             self.n, self.m = self.X.shape
             x_res = self.X.copy()
-            X_fill_svd = self.X_fill # renaming because X_filled is an SVD, if the original matrix was sparse. Its clunky do do it this way, but if X_original was passed it is safe to say we had a sparse matrix to start.
 
         if self.verbose:
             print("[SoftImpute] Max Singular Value of X_init = %f" % (
@@ -316,88 +229,54 @@ class SoftImpute(Solver):
 
         shrinkage_value = self.shrinkage_value
         
-        if self.fill_method != 'sparse':
-            observed_mask = ~missing_mask
+        for i in range(self.max_iters):
+            self.X_fill_old = self.X_fill
+            U, Dsq, V = self.X_fill
 
-            for i in range(self.max_iters):
-                x_reconstruction, rank = self._svd_step(x_filled, shrinkage_value)
-                converged = self._converged(self._svd(x_filled), self._svd(x_reconstruction))
-                x_filled[missing_mask] = x_reconstruction[missing_mask]
-                x_reconstruction = self.clip(x_reconstruction)
+            if i == 0:
+                self.X_splr = SPLR(x_res)
 
-            return X_filled
+            else:
+                BD = self._UD(V, Dsq, self.m)
+                x_hat = self._xhat_pred()
+                x_res.data = X_original.data - x_hat # TODO - this may not work if .data isn't a type for the input data source. Also, can the input source data be overwritten like this?
+                self.X_splr = SPLR(x_res, U, BD)
 
-        else:
-            for i in range(self.max_iters):
-                X_fill_svd_old = X_fill_svd
-                U, Dsq, V = X_fill_svd
+            self._als_step()
+            converged = self._converged(self.X_fill_old, self.X_fill)
 
-                if i == 0:
-                    X_filled = SPLR(x_res)
-
-                else:
-                    BD = self._UD(V, Dsq, self.m)
-                    x_hat = self._xhat_pred(X_fill_svd, X_original)
-                    x_res.data = X_original.data - x_hat # TODO - this may not work if .data isn't a type for the input data source. Also, can the input source data be overwritten like this?
-                    X_filled = SPLR(x_res, U, BD)
-
-                X_fill_svd = self._als_step(X_fill_svd, X_filled)
-                converged = self._converged(X_fill_svd_old, X_fill_svd)
-
-                if converged:
-                    break
+            if converged:
+                break
             
-            if self.verbose:
-                print("[SoftImpute] Stopped after iteration %d for lambda=%f" % (
-                    i + 1,
-                    shrinkage_value))
-            U, D_sq, V = X_fill_svd
-            A = X_filled.r_mult(V)
-            U, D_sq, V_part = self._svd(A)
-            V = X_filled.a.dot(V_part.T)
-            D_sq = np.clip(D_sq - self.shrinkage_value, a_min=0, a_max=None)
-            J = min((D_sq>0).sum(), J)
-            x_fill_svd = U[:,:J], D_sq[:J], V[:, :J]
-            self.X_fill = X_fill_svd
-            return X_fill_svd
+        if self.verbose:
+            print("[SoftImpute] Stopped after iteration %d for lambda=%f" % (
+                i + 1,
+                shrinkage_value))
+        U, D_sq, V = self.X_fill
+        A = self.X_splr.r_mult(V)
+        U, D_sq, V_part = self._svd(A)
+        V = self.X_splr.a.dot(V_part.T)
+        D_sq = np.clip(D_sq - self.shrinkage_value, a_min=0, a_max=None)
+        J = min((D_sq>0).sum(), J)
+        return self.X_fill
 
-            # print error on observed data
-#            if self.verbose:
-#                mae = masked_mae(
-#                    X_true=X_init,
-#                    X_pred=X_reconstruction,
-#                    mask=observed_mask)
-#                print(
-#                    "[SoftImpute] Iter %d: observed MAE=%0.6f rank=%d" % (
-#                        i + 1,
-#                        mae,
-#                        rank))
-
-#            converged = self._converged(
-#                X_old=X_filled,
-#                X_new=X_reconstruction,
-#                missing_mask=missing_mask)
-#            X_filled[missing_mask] = X_reconstruction[missing_mask]
-    def scale_and_center(self, row_id, col_id, prediction):
-        ''' takes a single predicted value, and returns the scaled and centered version. '''
-        #print(self.X.row_center[row_id], self.X.col_center[col_id])
-        scaled = prediction * self.X.row_scale[row_id] * self.X.col_scale[col_id]
-        centered = scaled + self.X.row_center[row_id] + self.X.col_center[col_id]
-        return centered
-         
-
-    def predict(self, row_id, col_id):
+    def _predict_one(self, row_id, col_id):
+        """ A single row ID and column ID are input to produce a single prediction """
         irows, icols, _ = self.missing_mask
         existing = zip(irows, icols)
 
         if isinstance(row_id, (int, long)) and isinstance(col_id, (int, long)):
             if (row_id, col_id) in existing:
                 prediction = self.X[row_id, col_id]
-                return self.scale_and_center(row_id, col_id, prediction)
+                if self.normalizer == None:
+                    return prediction
+                return self.normalizer.transform(self.X, row_id, col_id, prediction)
 
             elif col_id < self.m and row_id < self.n:
                 prediction = self._pred_sparse(row_id, col_id, self.X_fill)
-                return self.scale_and_center(row_id, col_id, prediction)
+                if self.normalizer == None:
+                    return prediction
+                return self.normalizer.transform(self.X, row_id, col_id, prediction)
                 
             else:
                 if col_id >= self.m:
@@ -406,61 +285,49 @@ class SoftImpute(Solver):
                     raise ValueError("Row index %s is out of range" % (row_id))
 
         else:
-            raise ValueError("Input to predict must be two integers. Use predict_many to predict for multiple index pairs at once")
+            raise ValueError("Input row_ids and col_ids must be integers.")
 
-    def predict_many(self, row_ids, col_ids):
+    def predict(self, row_ids, col_ids):
+        """ Makes predictions for a given set of row_ids and col_ids.
+
+        row_ids: array or integer
+            Consecutive row IDs to be matched to a column ID array of equal length.
+            Single integers are also accepted to produce a single prediction.
+            
+        col_ids: array or integer
+            Consecutive column IDs to be matched to a row ID array of equal length.
+            Single integers are also accepted to produce a single prediction.
+
+        Returns: array or integer
+        """
         if isinstance(row_ids, (int, long)) and isinstance(col_ids, (int, long)):
-            return self.predict(row_ids, col_ids)
+            return self._predict_one(row_ids, col_ids)
 
         elif len(row_ids) != len(col_ids):
             raise ValueError("Length of row list and column list must match")
 
-        elif self.fill_method == "sparse":
+        else:
             targets = zip(row_ids, col_ids)
             res = np.empty(len(targets))
             for idx, (r, c) in enumerate(targets): # TODO- this could be made into a matrix multiplication, which would add some speed
-                res[idx] = self.predict(r, c)
+                res[idx] = self._predict_one(r, c)
             return res
 
     def score(self):
         """
         Evaluate Root Mean Squared Error of Reconstructed X
         """
-        xhat = self._xhat_pred(self.X_fill, self.X)
+        xhat = self._xhat_pred()
         x = self.X.data
         mse = mean_squared_error(x, xhat)
         return np.sqrt(mse)
                 
 if __name__ == '__main__':
-    # original version - mat = np.array([[0.8654889, 0.01565179, 0.1747903, 0, 0],[-0.6004172, 0, -0.2119090, 0, 0],[-0.7169292, 0, 0, 0.06437356, -0.09754133],[0.6965558, -0.50331812, 0.5584839, 1.54375663, 0],[1.2311610, -0.34232368, -0.8102688, -0.82006429, -0.13256942],[0.2664415, 0.14486388, 0, 0, -2.24087863]])
-    # bscale = BiScaler(scale_rows=False,scale_columns=False)
-    # xsc = bscale.fit_transform(mat)
-    '''
-    xsc = np.array([[ 0.1390011, -0.09270246, -0.04629866, 0, 0], [-0.4469535, 0,  0.44695354, 0, 0], [-0.8252855, 0, 0,  0.1160078,  0.7092777], [-0.1981945, -0.7993484,  0.16913247,  0.8089969, 0], [ 0.9662344,  0.01088327, -0.56979652, -0.9250004,  0.5176792], [ 0.3651963,  0.86175224, 0, 0, -1.2269486]])
-    x_orig = csr_matrix(xsc)
-    '''
-
     x =  np.array([0.86548894, -0.60041722, -0.71692924,  0.69655580,  1.23116102,  0.26644155,  0.01565179, -0.50331812, -0.34232368,  0.14486388,  0.17479031, -0.21190900,  0.55848392, -0.81026875, 0.06437356,  1.54375663, -0.82006429, -0.09754133, -0.13256942, -2.24087863])
     x_idx = np.array([0, 1, 2, 3, 4, 5, 0, 3, 4, 5, 0, 1, 3, 4, 2, 3, 4, 2, 4, 5]) 
     x_p = np.array([0, 6, 10, 14, 17, 20])
     xs = csc_matrix((x, x_idx, x_p), shape=(6,5))
-    bs = BiScale(xs)
-    x_in = bs.solve()
-
-    sf = SoftImpute(max_rank=3, shrinkage_value=1, fill_method='sparse')
-   # X_original, missing_mask = sf.prepare_input_data(x_orig)
-   # X_svd = sf.fill(X_original, missing_mask, inplace=True)
-   # U, Dsq, V = X_svd
-   # m, n = X_original.shape
-   # BD = sf._UD(V, Dsq, m) 
-   # x_hat = sf._x_real_pred(U, Dsq, V, X_original.row, X_original.col)
-   # x_res = X_original.copy()
-   # x_res.data = X_original.data - x_hat
-   # X_original = SPLR(x_res, U, BD)
-   # sf._als_step(x_svd, x_original)
-#    import ipdb; ipdb.set_trace()
-    sf.single_imputation(x_in)
-    print(sf.predict_many(np.array([1,2]), np.array([1,1])))
-
-
+    sf = SoftImpute(max_rank=3, shrinkage_value=1)
+    sf.complete(xs)
+    print(sf.predict(np.array([1,2]), np.array([1,1])))
 
